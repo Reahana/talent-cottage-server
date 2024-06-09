@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { MongoClient, ServerApiVersion,ObjectId } = require('mongodb');
 require('dotenv').config()
 const app = express();
+const stripe = require('stripe')(process.env.PAYMENT_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -28,9 +29,9 @@ const client = new MongoClient(uri, {
       const classCollection = client.db("talentDB").collection("classes");
       const instructorCollection = client.db("talentDB").collection("instructors");
       const userCollection = client.db("talentDB").collection("users");
-
-
-
+      const cartCollection =client.db("talentDB").collection("carts");
+      const paymentCollection = client.db("talentDB").collection("payments");
+      const enrolledCourseCollection = client.db("talentDB").collection("enrolledCourses");
       
   //=========== jwt start  ==========
 
@@ -84,7 +85,74 @@ app.post('/users', async (req, res) => {
 });
 
 
+// get admin 
+app.get('/users/admin/:email', verifyToken, async (req, res) => {
+  const email = req.params.email;
 
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: 'forbidden access' })
+  }
+
+  const query = { email: email };
+  const user = await userCollection.findOne(query);
+  let admin = false;
+  if (user) {
+    admin = user?.role === 'admin';
+  }
+  res.send({ admin });
+})
+
+//get instrutor
+app.get('/users/instructor/:email', verifyToken, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: 'forbidden access' })
+  }
+
+  const query = { email: email };
+  const user = await userCollection.findOne(query);
+  let instructor = false;
+  if (user) {
+    instructor = user?.role === 'instructor';
+  }
+  res.send({ instructor });
+})
+
+
+// make admin
+app.patch('/users/admin/:id', verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const filter = { _id: new ObjectId(id) };
+  const updatedDoc = {
+    $set: {
+      role: 'admin'
+    }
+  }
+  const result = await userCollection.updateOne(filter, updatedDoc);
+  res.send(result);
+})
+
+
+//make instructor
+app.patch('/users/instructor/:id', verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const filter = { _id: new ObjectId(id) };
+  const updatedDoc = {
+    $set: {
+      role: 'instructor'
+    }
+  }
+  const result = await userCollection.updateOne(filter, updatedDoc);
+  res.send(result);
+})
+
+app.delete('/users/:id', verifyToken, async (req, res) => {
+  const id = req.params.id;
+  const query = { _id: new ObjectId(id) }
+  const result = await userCollection.deleteOne(query);
+  res.send(result);
+})
 
 // ===== Class collection =====
 
@@ -112,6 +180,19 @@ app.post('/users', async (req, res) => {
       const result = await classCollection.insertOne(item);
       res.send(result);
     });
+
+    app.patch('/class/:id',  async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) };
+      const updatedDoc = {
+        $inc: {
+          students:  + 1,
+          seats: -1
+        }
+      }
+      const result = await classCollection.updateOne(filter, updatedDoc);
+      res.send(result);
+    })
   
     app.delete('/class/:id', async (req, res) => {
       const id = req.params.id;
@@ -123,9 +204,108 @@ app.post('/users', async (req, res) => {
 //  ===== instructors collection =====
 
     app.get('/instructors', async(req, res) =>{
+   
       const result = await instructorCollection.find().toArray();
       res.send(result);
     })
+
+//========= Payment collection
+// payment intent
+app.post('/create-payment-intent', verifyToken, async (req, res) => {
+  const { price } = req.body;
+  const amount = parseInt(price * 100);
+  console.log(amount, 'amount inside the intent')
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: amount,
+    currency: 'usd',
+    payment_method_types: ['card']
+  });
+
+  res.send({
+    clientSecret: paymentIntent.client_secret
+  })
+});
+
+
+app.get('/payments/:email', verifyToken, async (req, res) => {
+  const query = { email: req.params.email }
+  if (req.params.email !== req.decoded.email) {
+    return res.status(403).send({ message: 'forbidden access' });
+  }
+  const result = await paymentCollection.find(query).toArray();
+  res.send(result);
+})
+
+app.post('/payments', verifyToken, async (req, res) => {
+  const payment = req.body;
+  const paymentResult = await paymentCollection.insertOne(payment);
+
+  //  carefully delete each item from the cart
+  console.log('payment info', payment);
+  const query = {
+    _id: {
+      $in: payment.cartIds.map(id => new ObjectId(id))
+    }
+  };
+
+  const deleteResult = await cartCollection.deleteMany(query);
+
+  res.send({ paymentResult, deleteResult });
+})
+
+
+
+//====== cart collection ===
+// Select course
+
+app.get('/carts',verifyToken , async (req, res) => {
+  const email = req.query.email;
+  const decodedEmail = req.decoded.email
+  if(email !== decodedEmail)
+  {
+    return res.status(401).send({ message: 'unauthorized access' })
+  }
+  const query = { email: email };
+  const result = await cartCollection.find(query).toArray();
+  res.send(result);
+});
+
+app.post('/carts', async (req, res) => {
+  const cartItem = req.body;
+  const result = await cartCollection.insertOne(cartItem);
+  res.send(result);
+});
+
+app.delete('/carts/:id', async (req, res) => {
+  const id = req.params.id;
+  const query = { _id: new ObjectId(id) }
+  const result = await cartCollection.deleteOne(query);
+  res.send(result);
+})
+
+
+//============== Enrolled Course Collection
+ 
+app.get('/enrolled-courses',verifyToken, async(req, res) =>{
+  const email = req.query.email;
+  const decodedEmail = req.decoded.email
+  if(email !== decodedEmail)
+  {
+    return res.status(401).send({ message: 'unauthorized access' })
+  }
+  const query = { email: email };
+  const result = await enrolledCourseCollection.find(query).toArray();
+  res.send(result);
+  
+})
+ 
+
+app.post('/enrolled-courses', async (req, res) => {
+  const course = req.body;
+  const result = await enrolledCourseCollection.insertOne(course);
+  res.send(result);
+});
 
 
 
